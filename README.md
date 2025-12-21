@@ -5,7 +5,7 @@ Please regard it as just that, an example, and don't rely on this as a dependenc
 
 Alternative videoplayers:
 
-* Native videoplayer (Android/iOS/macOS/HTML5) - [extension-videoplayer-native](https://github.com/defold/extension-videoplayer-native)
+* Native videoplayer (Android/iOS/macOS/Windows/HTML5) - [extension-videoplayer-native](https://github.com/defold/extension-videoplayer-native)
 * MPEG1 videoplayer - [extension-videoplayer-mpeg](https://github.com/defold/extension-videoplayer-mpeg)
 
 
