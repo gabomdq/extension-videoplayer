@@ -19,6 +19,17 @@
 #include "webm/mkvparser/mkvparser.h"
 #include "webm/mkvparser/mkvreader.h"
 
+// EBML element IDs used for VP9+alpha BlockAdditional extraction
+#define EBML_ID_BLOCK_GROUP      0xA0u
+#define EBML_ID_BLOCK            0xA1u
+#define EBML_ID_SIMPLE_BLOCK     0xA3u
+#define EBML_ID_BLOCK_ADDITIONS  0x75A1u
+#define EBML_ID_BLOCK_MORE       0xA6u
+#define EBML_ID_BLOCK_ADD_ID     0xEEu
+#define EBML_ID_BLOCK_ADDITIONAL 0xA5u
+// 4-byte EBML IDs (cluster/segment level) have 0x1 as their top nibble
+#define EBML_ID_IS_SEGMENT_LEVEL(id) (((id) >> 28) == 0x1u)
+
 // DEFOLD ADDITION
 namespace mkvparser
 {
@@ -75,6 +86,82 @@ namespace mkvparser
 
 namespace {
 
+// Read an EBML element header (ID + data size) from reader at pos.
+// Returns 0 on success, -1 on error.
+static int ebml_read_header(mkvparser::IMkvReader* reader, long long pos,
+                            uint32_t* out_id, uint64_t* out_size, int* out_header_len) {
+  unsigned char buf[12] = {0};
+  if (reader->Read(pos, 12, buf) != 0) return -1;
+
+  unsigned char b0 = buf[0];
+  int id_len;
+  uint32_t id;
+  if      (b0 & 0x80) { id = b0;                                                                                      id_len = 1; }
+  else if (b0 & 0x40) { id = ((uint32_t)b0 << 8)  | buf[1];                                                          id_len = 2; }
+  else if (b0 & 0x20) { id = ((uint32_t)b0 << 16) | ((uint32_t)buf[1] << 8) | buf[2];                                id_len = 3; }
+  else if (b0 & 0x10) { id = ((uint32_t)b0 << 24) | ((uint32_t)buf[1] << 16) | ((uint32_t)buf[2] << 8) | buf[3];    id_len = 4; }
+  else return -1;
+
+  unsigned char s0 = buf[id_len];
+  int size_len;
+  uint64_t sz;
+  if      (s0 & 0x80) { sz = s0 & 0x7F;                                                                                             size_len = 1; }
+  else if (s0 & 0x40) { sz = ((uint64_t)(s0 & 0x3F) << 8)  | buf[id_len+1];                                                        size_len = 2; }
+  else if (s0 & 0x20) { sz = ((uint64_t)(s0 & 0x1F) << 16) | ((uint64_t)buf[id_len+1] << 8) | buf[id_len+2];                       size_len = 3; }
+  else if (s0 & 0x10) { sz = ((uint64_t)(s0 & 0x0F) << 24) | ((uint64_t)buf[id_len+1] << 16) | ((uint64_t)buf[id_len+2] << 8) | buf[id_len+3]; size_len = 4; }
+  else return -1;
+
+  *out_id = id; *out_size = sz; *out_header_len = id_len + size_len;
+  return 0;
+}
+
+// Scan EBML elements immediately after the Block payload for BlockAdditions (0x75A1).
+// If found, extract the BlockAdditional (VP9 alpha bitstream) into webm_ctx->alpha_buffer.
+static void find_alpha_data(mkvparser::IMkvReader* reader,
+                            const mkvparser::Block* block,
+                            struct WebmInputContext* webm_ctx) {
+  webm_ctx->alpha_frame_size = 0;
+  long long pos = block->m_start + block->m_size;
+
+  for (int guard = 0; guard < 8; ++guard) {
+    uint32_t id; uint64_t elem_size; int hl;
+    if (ebml_read_header(reader, pos, &id, &elem_size, &hl) != 0) return;
+
+    if (id == EBML_ID_BLOCK_ADDITIONS) {
+      long long ba_pos = pos + hl, ba_end = ba_pos + (long long)elem_size;
+      while (ba_pos < ba_end) {
+        uint32_t bm_id; uint64_t bm_size; int bm_hl;
+        if (ebml_read_header(reader, ba_pos, &bm_id, &bm_size, &bm_hl) != 0) return;
+        if (bm_id == EBML_ID_BLOCK_MORE) {
+          long long it_pos = ba_pos + bm_hl, it_end = it_pos + (long long)bm_size;
+          while (it_pos < it_end) {
+            uint32_t it_id; uint64_t it_size; int it_hl;
+            if (ebml_read_header(reader, it_pos, &it_id, &it_size, &it_hl) != 0) return;
+            if (it_id == EBML_ID_BLOCK_ADDITIONAL) {
+              size_t alpha_size = (size_t)it_size;
+              if (alpha_size > webm_ctx->alpha_buffer_size) {
+                delete[] webm_ctx->alpha_buffer;
+                webm_ctx->alpha_buffer      = new uint8_t[alpha_size];
+                webm_ctx->alpha_buffer_size = alpha_size;
+              }
+              if (reader->Read(it_pos + it_hl, (long)alpha_size, webm_ctx->alpha_buffer) == 0)
+                webm_ctx->alpha_frame_size = alpha_size;
+              return;
+            }
+            it_pos += it_hl + (long long)it_size;
+          }
+        }
+        ba_pos += bm_hl + (long long)bm_size;
+      }
+      return;
+    }
+    // Stop if we've hit another block-group-level or cluster-level element
+    if (id == EBML_ID_BLOCK_GROUP || id == EBML_ID_BLOCK ||
+        id == EBML_ID_SIMPLE_BLOCK || EBML_ID_IS_SEGMENT_LEVEL(id)) return;
+    pos += hl + (long long)elem_size;
+  }
+}
+
 void reset(struct WebmInputContext *const webm_ctx) {
   if (webm_ctx->reader != NULL) {
     mkvparser::MkvBufferReader *const reader = reinterpret_cast<mkvparser::MkvBufferReader *>(webm_ctx->reader);
@@ -88,6 +175,9 @@ void reset(struct WebmInputContext *const webm_ctx) {
   if (webm_ctx->buffer != NULL) {
     delete[] webm_ctx->buffer;
   }
+  if (webm_ctx->alpha_buffer != NULL) {
+    delete[] webm_ctx->alpha_buffer;
+  }
   webm_ctx->reader = NULL;
   webm_ctx->segment = NULL;
   webm_ctx->buffer = NULL;
@@ -98,6 +188,9 @@ void reset(struct WebmInputContext *const webm_ctx) {
   webm_ctx->video_track_index = 0;
   webm_ctx->timestamp_ns = 0;
   webm_ctx->is_key_frame = false;
+  webm_ctx->alpha_buffer      = NULL;
+  webm_ctx->alpha_buffer_size = 0;
+  webm_ctx->alpha_frame_size  = 0;
 }
 
 void get_first_cluster(struct WebmInputContext *const webm_ctx) {
@@ -263,7 +356,12 @@ int webm_read_frame(struct WebmInputContext *webm_ctx, uint8_t **buffer,
 
   mkvparser::MkvBufferReader *const reader =
       reinterpret_cast<mkvparser::MkvBufferReader *>(webm_ctx->reader);
-  return frame.Read(reader, *buffer) ? -1 : 0;
+  int result = frame.Read(reader, *buffer) ? -1 : 0;
+  if (result == 0)
+    find_alpha_data(reader, block, webm_ctx);
+  else
+    webm_ctx->alpha_frame_size = 0;
+  return result;
 }
 
 int webm_guess_framerate(struct WebmInputContext *webm_ctx,

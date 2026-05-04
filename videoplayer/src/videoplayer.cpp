@@ -17,8 +17,9 @@
 #include <vpx/tools/tools_common.h> // VpxInputContext
 #include <webm/webmdec.h>           // WebmInputContext
 
-static const int s_BytesPerPixel = 3;
+static const int s_BytesPerPixel = 4;
 
+#define CLAMP(_X_) ((_X_) < 0 ? 0 : ((_X_) > 255 ? 255 : (_X_)))
 
 enum MovieType
 {
@@ -32,6 +33,7 @@ struct Movie
     WebmInputContext    m_WebmCtx;
     const VpxInterface* m_FourCCInterface;
     vpx_codec_ctx_t     m_Decoder;
+    vpx_codec_ctx_t     m_AlphaDecoder;
     vpx_codec_dec_cfg_t m_DecoderCfg;
     dmBuffer::HBuffer   m_VideoBuffer; // Output
     MovieType           m_Type;
@@ -39,9 +41,10 @@ struct Movie
     int                 m_Frame;
     int                 m_VideoBufferLuaRef;
     int                 m_Corrupted;
+    int                 m_HasAlphaDecoder;
 };
 
-static uint64_t g_VideoBufferStreamName = dmHashString64("rgb");
+static uint64_t g_VideoBufferStreamName = dmHashString64("rgba");
 
 
 static int Open(lua_State* L)
@@ -91,10 +94,13 @@ static int Open(lua_State* L)
         luaL_error(L, "Failed to initialize decoder");
     }
 
+    if (vpx_codec_dec_init(&movie->m_AlphaDecoder, movie->m_FourCCInterface->codec_interface(), &movie->m_DecoderCfg, 0) == 0) {
+        movie->m_HasAlphaDecoder = 1;
+    }
 
     const uint32_t size = movie->m_VpxCtx.width*movie->m_VpxCtx.height;
     dmBuffer::StreamDeclaration streams_decl[] = {
-        {g_VideoBufferStreamName, dmBuffer::VALUE_TYPE_UINT8, 3}
+        {g_VideoBufferStreamName, dmBuffer::VALUE_TYPE_UINT8, 4}
     };
 
     dmBuffer::Create(size, streams_decl, 1, &movie->m_VideoBuffer);
@@ -126,6 +132,8 @@ static int Close(lua_State* L)
 
     webm_free(&movie->m_WebmCtx);
     vpx_codec_destroy(&movie->m_Decoder);
+    if (movie->m_HasAlphaDecoder)
+        vpx_codec_destroy(&movie->m_AlphaDecoder);
 
     dmScript::Unref(L, LUA_REGISTRYINDEX, movie->m_VideoBufferLuaRef); // We want it destroyed by the GC
 
@@ -133,17 +141,17 @@ static int Close(lua_State* L)
     return 0;
 }
 
-// http://stackoverflow.com/questions/17088118/decode-from-vp8-video-frame-to-rgb
-void ConvertYV12toRGB(const vpx_image_t* img, uint32_t buffersize, uint8_t* buffer)
+void ConvertYV12toRGBA(const vpx_image_t* img, const vpx_image_t* alpha_img,
+                       uint32_t buffersize, uint8_t* buffer)
 {
     uint8_t* yPlane = img->planes[VPX_PLANE_Y];
     uint8_t* uPlane = img->planes[VPX_PLANE_U];
     uint8_t* vPlane = img->planes[VPX_PLANE_V];
+    uint8_t* aPlane = alpha_img ? alpha_img->planes[VPX_PLANE_Y] : NULL;
 
     int stride = img->d_w * s_BytesPerPixel;
     buffer = buffer + buffersize - stride;
 
-    int i = 0;
     for (unsigned int imgY = 0; imgY < img->d_h; imgY++) {
         for (unsigned int imgX = 0; imgX < img->d_w; imgX++) {
             int y = yPlane[imgY * img->stride[VPX_PLANE_Y] + imgX];
@@ -154,15 +162,16 @@ void ConvertYV12toRGB(const vpx_image_t* img, uint32_t buffersize, uint8_t* buff
             int d = (u - 128);
             int e = (v - 128);
 
-            #define CLAMP(_X_) ((_X_) < 0 ? 0 : ((_X_)>255 ? 255 : (_X_)))
-
             int r = CLAMP((298 * c           + 409 * e + 128) >> 8);
             int g = CLAMP((298 * c - 100 * d - 208 * e + 128) >> 8);
             int b = CLAMP((298 * c + 516 * d           + 128) >> 8);
+            int a = aPlane ? aPlane[imgY * alpha_img->stride[VPX_PLANE_Y] + imgX] : 255;
 
-            buffer[imgX*3 + 0] = (uint8_t)r;
-            buffer[imgX*3 + 1] = (uint8_t)g;
-            buffer[imgX*3 + 2] = (uint8_t)b;
+            // Defold's BLEND_MODE_ALPHA expects premultiplied alpha
+            buffer[imgX*4 + 0] = (uint8_t)((r * a + 127) / 255);
+            buffer[imgX*4 + 1] = (uint8_t)((g * a + 127) / 255);
+            buffer[imgX*4 + 2] = (uint8_t)((b * a + 127) / 255);
+            buffer[imgX*4 + 3] = (uint8_t)a;
         }
         buffer -= stride;
     }
@@ -232,11 +241,29 @@ static int Update(lua_State* L)
                 printf("Video frame decode error: '%s'", detail);
                 return 0;
             }
+            if (movie->m_HasAlphaDecoder && movie->m_WebmCtx.alpha_frame_size > 0) {
+                vpx_codec_decode(&movie->m_AlphaDecoder,
+                                 movie->m_WebmCtx.alpha_buffer,
+                                 (unsigned int)movie->m_WebmCtx.alpha_frame_size,
+                                 NULL, 0);
+            }
         }
     }
 
+    // Drain both decoders to the latest frame so queues don't accumulate
+    // across Updates with num_frames_tick > 1, and so RGB/alpha stay aligned.
+    vpx_image_t* img = NULL;
     vpx_codec_iter_t iter = NULL;
-    vpx_image_t* img = vpx_codec_get_frame(&movie->m_Decoder, &iter);
+    for (vpx_image_t* tmp; (tmp = vpx_codec_get_frame(&movie->m_Decoder, &iter)) != NULL; )
+        img = tmp;
+
+    vpx_image_t* alpha_img = NULL;
+    if (movie->m_HasAlphaDecoder) {
+        vpx_codec_iter_t alpha_iter = NULL;
+        for (vpx_image_t* tmp; (tmp = vpx_codec_get_frame(&movie->m_AlphaDecoder, &alpha_iter)) != NULL; )
+            alpha_img = tmp;
+    }
+
     if( !img )
     {
         VpxRational framerate = movie->m_VpxCtx.framerate;
@@ -245,12 +272,20 @@ static int Update(lua_State* L)
         movie->m_VpxCtx.framerate = framerate;
         movie->m_Time = 0;
         movie->m_Frame = 0;
-        // TODO: Callback ?
+        vpx_codec_destroy(&movie->m_Decoder);
+        vpx_codec_dec_init(&movie->m_Decoder, movie->m_FourCCInterface->codec_interface(), &movie->m_DecoderCfg, 0);
+        if (movie->m_HasAlphaDecoder) {
+            vpx_codec_destroy(&movie->m_AlphaDecoder);
+            vpx_codec_dec_init(&movie->m_AlphaDecoder, movie->m_FourCCInterface->codec_interface(), &movie->m_DecoderCfg, 0);
+        }
         return 0;
     }
 
-    // component size is 1
-    ConvertYV12toRGB(img, out_size * out_stride, (uint8_t*)out_stream);
+    if (movie->m_HasAlphaDecoder && !alpha_img) {
+        return 0;
+    }
+
+    ConvertYV12toRGBA(img, alpha_img, out_size * out_stride, (uint8_t*)out_stream);
 
     dmBuffer::ValidateBuffer(movie->m_VideoBuffer);
 

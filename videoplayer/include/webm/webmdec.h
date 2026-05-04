@@ -30,6 +30,10 @@ struct WebmInputContext {
   uint64_t timestamp_ns;
   int is_key_frame;
   int reached_eos;
+  // VP9+alpha: BlockAdditional data for the current frame (NULL if none)
+  uint8_t *alpha_buffer;
+  size_t   alpha_buffer_size;
+  size_t   alpha_frame_size;
 };
 
 // Checks if the input is a WebM file. If so, initializes WebMInputContext so
